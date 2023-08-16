@@ -1,0 +1,20 @@
+[
+	{
+		"type": "group",
+		"title": "Server Setting",
+		"items": [
+			{
+				"type": "text",
+				"key": "kavitaAddress",
+				"default": "https://demo.kavitareader.com",
+				"placeholder": "Kavita Server URL"
+			},
+			{
+				"type": "text",
+				"key": "kavitaAPIKey",
+				"default": "",
+				"placeholder": "Kavita Server API Key"
+			}
+		]
+	}
+]
