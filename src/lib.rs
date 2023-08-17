@@ -326,8 +326,8 @@ fn get_page_list(_: String, chapter_id: String) -> Result<Vec<Page>> {
 
 	let response = request.json().unwrap();
 	let page_number = response.as_object().unwrap().get("pages").as_int().unwrap();
-	Ok((1..page_number).map(|i| Page {
-		index: i as i32,
+	Ok((0..page_number).map(|i| Page {
+		index: i as i32 + 1,
 		url: format!("{}/Reader/image?chapterId={}&page={}&apiKey={}&extractPdf=true", kavita_api_url.clone(), chapter_id, i, kavita_api_key.clone()),
 		..Default::default()
 	}).collect())
