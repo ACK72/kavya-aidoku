@@ -3,10 +3,14 @@
 		"id": "multi.kavya",
 		"lang": "multi",
 		"name": "Kavya",
-		"version": 0,
+		"version": 1,
 		"url": "https://github.com/ACK72/kavya-aidoku",
 		"nsfw": 0
 	},
 	"listings": [
+		{ "name": "On Deck" },
+		{ "name": "Recently Updated" },
+		{ "name": "Newly Added" },
+		{ "name": "Want To Read" }
 	]
 }

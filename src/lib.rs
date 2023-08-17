@@ -1,17 +1,17 @@
 #![no_std]
 extern crate alloc;
+
 use aidoku::{
-	error::Result,
+	error::{AidokuError, AidokuErrorKind, Result},
 	prelude::*,
 	std::{defaults::defaults_get, String, Vec, net::Request},
 	helpers::uri::encode_uri,
-	Chapter, Filter, Listing, Manga, MangaPageResult, Page
+	Chapter, Filter, Listing, Manga, MangaPageResult, Page, MangaStatus, FilterType
 };
 use alloc::string::ToString;
 use core::cmp::Ordering;
 
 static mut KAVITA_API_AUTH: String = String::new();
-static mut KAVITA_API_AUTH_MUTEX: bool = false;
 
 fn get_kavita_api_url() -> String {
 	defaults_get("kavitaAddress").unwrap().as_string().unwrap().to_string().trim_end_matches('/').to_string() + "/api"
@@ -21,14 +21,12 @@ fn get_kavita_api_key() -> String {
 	defaults_get("kavitaAPIKey").unwrap().as_string().unwrap().to_string()
 }
 
+fn clear_kavita_api_auth() {
+	unsafe { KAVITA_API_AUTH = String::new(); }
+}
+
 fn get_kavita_api_auth() -> String {
-	if unsafe { KAVITA_API_AUTH.clone() }.is_empty() {
-		unsafe {
-			KAVITA_API_AUTH_MUTEX = true;
-		}
-
-		// todo!("Implement mutex");
-
+	if unsafe { KAVITA_API_AUTH.is_empty() } {
 		let kavita_api_url = get_kavita_api_url();
 		let kavita_api_key = get_kavita_api_key();
 		let request_url = format!("{}/Plugin/authenticate?apiKey={}&pluginName=Kavya", kavita_api_url.clone(), kavita_api_key.clone());
@@ -37,27 +35,60 @@ fn get_kavita_api_auth() -> String {
 		let auth = response.as_object().unwrap().get("token").as_string().unwrap().to_string();
 
 		unsafe {
-			KAVITA_API_AUTH = format!("Bearer {}", auth);
-			KAVITA_API_AUTH_MUTEX = false;
+			KAVITA_API_AUTH = auth;
 		}
 	}
 
-	unsafe { KAVITA_API_AUTH.clone() }
+	unsafe { format!("Bearer {}", KAVITA_API_AUTH.clone()) }
 }
 
 #[get_manga_list]
-fn get_manga_list(_filters: Vec<Filter>, page: i32) -> Result<MangaPageResult> {
+fn get_manga_list(filters: Vec<Filter>, page: i32) -> Result<MangaPageResult> {
 	let kavita_api_url = get_kavita_api_url();
 	let kavita_api_key = get_kavita_api_key();
-	let request_url = format!("{}/Series/all?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40);
 
-	let response = Request::post(encode_uri(&request_url))
-		.header("Authorization", get_kavita_api_auth().as_str())
-		.header("Content-Type", "application/json")
-		.body(String::from("{}").as_bytes())
-		.json()
-		.unwrap();
+	let mut query = String::new();
 
+	// Support of filters is not fully implemented yet
+	// Need to migrate /api/Series/v2 API in future
+	for filter in filters {
+		match filter.kind {
+			FilterType::Title => {
+				query = filter.value.as_string().unwrap().to_string();
+				break;
+			},
+			_ => continue
+		}
+	}
+	
+	let request_url;
+	let request_body;
+
+	if query.is_empty() {
+		request_url = format!("{}/Series/all?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40);
+		request_body = "{}".to_string();
+	} else {
+		// Cannot use /api/Search/search?queryString API, seems have an internal error
+		request_url = format!("{}/Series?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40);
+		request_body = serde_json::json!({
+			"seriesNameQuery": query
+		}).to_string();
+	};
+
+	let request = Request::post(encode_uri(&request_url))
+			.header("Authorization", get_kavita_api_auth().as_str())
+			.header("Content-Type", "application/json")
+			.body(request_body.as_bytes());
+
+	request.send();
+	if request.status_code() != 200 {
+		clear_kavita_api_auth();
+		return Err(AidokuError{
+			reason: AidokuErrorKind::JsonParseError
+		});
+	}
+
+	let response = request.json().unwrap();
 	let mut result = Vec::new();
 	for series_object in response.as_array().unwrap() {
 		let series = series_object.as_object().unwrap();
@@ -72,7 +103,7 @@ fn get_manga_list(_filters: Vec<Filter>, page: i32) -> Result<MangaPageResult> {
 		});
 	}
 
-	let has_more = result.len() == 40;
+	let has_more = result.len() == 40 && !query.is_empty();
 	Ok(MangaPageResult{
 		manga: result,
 		has_more: has_more
@@ -80,21 +111,43 @@ fn get_manga_list(_filters: Vec<Filter>, page: i32) -> Result<MangaPageResult> {
 }
 
 #[get_manga_listing]
-fn get_manga_listing(_listing: Listing, page: i32) -> Result<MangaPageResult> {
+fn get_manga_listing(listing: Listing, page: i32) -> Result<MangaPageResult> {
 	let kavita_api_url = get_kavita_api_url();
 	let kavita_api_key = get_kavita_api_key();
-	let request_url = format!("{}/Series/all?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40);
 
-	let response = Request::get(encode_uri(&request_url))
+	let mut key_id = "id";
+	let mut key_title = "name";
+	let request_url = match listing.name.as_str() {
+		"On Deck" => format!("{}/Series/on-deck?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40),
+		"Recently Updated" => {
+			key_id = "seriesId";
+			key_title = "seriesName";
+			format!("{}/Series/recently-updated-series", kavita_api_url.clone())
+		},
+		"Newly Added" => format!("{}/Series/recently-added?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40),
+		"Want To Read" => format!("{}/want-to-read?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40),
+		_ => format!("{}/Series/all?PageNumber={}&PageSize={}", kavita_api_url.clone(), page, 40)
+	};
+	
+	let request = Request::post(encode_uri(&request_url))
 		.header("Authorization", get_kavita_api_auth().as_str())
-		.json()
-		.unwrap();
+		.header("Content-Type", "application/json")
+		.body(String::from("{}").as_bytes());
+	
+	request.send();
+	if request.status_code() != 200 {
+		clear_kavita_api_auth();
+		return Err(AidokuError{
+			reason: AidokuErrorKind::JsonParseError
+		});
+	}
 
+	let response = request.json().unwrap();
 	let mut result = Vec::new();
 	for series_object in response.as_array().unwrap() {
 		let series = series_object.as_object().unwrap();
-		let id = series.clone().get("id").as_int().unwrap().to_string();
-		let title = series.get("name").as_string().unwrap().to_string();
+		let id = series.clone().get(key_id).as_int().unwrap().to_string();
+		let title = series.get(key_title).as_string().unwrap().to_string();
 
 		result.push(Manga {
 			id: id.clone(),
@@ -104,7 +157,10 @@ fn get_manga_listing(_listing: Listing, page: i32) -> Result<MangaPageResult> {
 		});
 	}
 
-	let has_more = result.len() == 40;
+	let has_more = match listing.name.as_str() {
+		"Recently Updated" => false,
+		_ => result.len() == 40
+	};
 	Ok(MangaPageResult{
 		manga: result,
 		has_more: has_more
@@ -115,18 +171,69 @@ fn get_manga_listing(_listing: Listing, page: i32) -> Result<MangaPageResult> {
 fn get_manga_details(manga_id: String) -> Result<Manga> {
 	let kavita_api_url = get_kavita_api_url();
 	let kavita_api_key = get_kavita_api_key();
-	let request_url = format!("{}/Series/{}", kavita_api_url.clone(), manga_id.clone());
 
-	let request = Request::get(encode_uri(&request_url))
-		.header("Authorization", get_kavita_api_auth().as_str())
-		.json()
-		.unwrap();
+	let series_url = format!("{}/Series/{}", kavita_api_url.clone(), manga_id.clone());
+	let series_req = Request::get(encode_uri(&series_url))
+		.header("Authorization", get_kavita_api_auth().as_str());
 
-	let manga = request.as_object().unwrap();
+	series_req.send();
+	if series_req.status_code() != 200 {
+		clear_kavita_api_auth();
+		return Err(AidokuError{
+			reason: AidokuErrorKind::JsonParseError
+		});
+	}
+
+	let metadata_url = format!("{}/Series/metadata?seriesId={}", kavita_api_url.clone(), manga_id.clone());
+	let metadata_req = Request::get(encode_uri(&metadata_url))
+		.header("Authorization", get_kavita_api_auth().as_str());
+
+	metadata_req.send();
+	if metadata_req.status_code() != 200 {
+		clear_kavita_api_auth();
+		return Err(AidokuError{
+			reason: AidokuErrorKind::JsonParseError
+		});
+	}
+
+	let series_resp = series_req.json().unwrap();
+	let metadata_resp = metadata_req.json().unwrap();
+	let series = series_resp.as_object().unwrap();
+	let metadata = metadata_resp.as_object().unwrap();
+
+	let mut authors = Vec::new();
+	for author in metadata.clone().get("pencillers").as_array().unwrap() {
+		authors.push(author.as_object().unwrap().get("name").as_string().unwrap().to_string());
+	}
+
+	let mut artists = Vec::new();
+	for artist in metadata.clone().get("writers").as_array().unwrap() {
+		artists.push(artist.as_object().unwrap().get("name").as_string().unwrap().to_string());
+	}
+
+	let mut categories = Vec::new();
+	for category in metadata.clone().get("genres").as_array().unwrap() {
+		categories.push(category.as_object().unwrap().get("title").as_string().unwrap().to_string());
+	}
+	for category in metadata.clone().get("tags").as_array().unwrap() {
+		categories.push(category.as_object().unwrap().get("title").as_string().unwrap().to_string());
+	}
+
 	Ok(Manga {
 		id: manga_id.clone(),
 		cover: format!("{}/image/series-cover?seriesId={}&apiKey={}", kavita_api_url.clone(), manga_id.clone(), kavita_api_key.clone()),
-		title: manga.get("name").as_string().unwrap().to_string(),
+		title: series.get("name").as_string().unwrap().to_string(),
+		author: authors.join(", ").to_string(),
+		artist: artists.join(", ").to_string(),
+		description: metadata.clone().get("summary").as_string().unwrap().to_string(),
+		categories: categories,
+		status: match metadata.get("publicationStatus").as_int().unwrap() {
+			0 => MangaStatus::Ongoing,
+			1 => MangaStatus::Hiatus,
+			2 => MangaStatus::Completed,
+			3 => MangaStatus::Cancelled,
+			_ => MangaStatus::Unknown
+		},
 		..Default::default()
 	})
 }
@@ -134,15 +241,21 @@ fn get_manga_details(manga_id: String) -> Result<Manga> {
 #[get_chapter_list]
 fn get_chapter_list(manga_id: String) -> Result<Vec<Chapter>> {
 	let kavita_api_url = get_kavita_api_url();
+
 	let request_url = format!("{}/Series/volumes?seriesId={}", kavita_api_url.clone(), manga_id.clone());
+	let request = Request::get(encode_uri(&request_url))
+		.header("Authorization", get_kavita_api_auth().as_str());
 
-	let response = Request::get(encode_uri(&request_url))
-		.header("Authorization", get_kavita_api_auth().as_str())
-		.json()
-		.unwrap();
+	request.send();
+	if request.status_code() != 200 {
+		clear_kavita_api_auth();
+		return Err(AidokuError{
+			reason: AidokuErrorKind::JsonParseError
+		});
+	}
 
+	let response = request.json().unwrap();
 	let mut result = Vec::new();
-
 	for volume_object in response.as_array().unwrap() {
 		let volume = volume_object.as_object().unwrap();
 		let volume_number = volume.clone().get("name").as_string().unwrap().to_string().parse::<f32>().unwrap();
@@ -151,13 +264,24 @@ fn get_chapter_list(manga_id: String) -> Result<Vec<Chapter>> {
 			let chapter = chapter_object.as_object().unwrap();
 			let id = chapter.clone().get("id").as_int().unwrap().to_string();
 			let title = chapter.clone().get("titleName").as_string().unwrap().to_string();
-			let chapter_number = chapter.get("number").as_string().unwrap().to_string().parse::<f32>().unwrap();
+			let chapter_number = chapter.clone().get("number").as_string().unwrap().to_string().parse::<f32>().unwrap();
+
+			//let chapter_read = chapter.clone().get("pagesRead").as_string().unwrap().to_string().parse::<i32>().unwrap();
+			let chapter_pages = chapter.get("pages").as_int().unwrap();
+			let chapter_special = chapter.get("isSpecial").as_bool().unwrap();
+
+			let info = if chapter_special {
+				format!("{} Page · Specials", chapter_pages)
+			} else {
+				format!("{} Page", chapter_pages)
+			};
 			
 			result.push(Chapter {
 				id: id,
 				title: title,
 				volume: volume_number,
 				chapter: chapter_number,
+				scanlator: info,
 				..Default::default()
 			});
 		}
@@ -178,6 +302,7 @@ fn get_chapter_list(manga_id: String) -> Result<Vec<Chapter>> {
 			}
 		}
 	});
+	result.reverse();
 
 	Ok(result)
 }
@@ -188,11 +313,18 @@ fn get_page_list(_: String, chapter_id: String) -> Result<Vec<Page>> {
 	let kavita_api_key = get_kavita_api_key();
 	let request_url = format!("{}/Series/chapter?chapterId={}", kavita_api_url.clone(), chapter_id.clone());
 
-	let response = Request::get(encode_uri(&request_url))
-		.header("Authorization", get_kavita_api_auth().as_str())
-		.json()
-		.unwrap();
+	let request = Request::get(encode_uri(&request_url))
+		.header("Authorization", get_kavita_api_auth().as_str());
 
+	request.send();
+	if request.status_code() != 200 {
+		clear_kavita_api_auth();
+		return Err(AidokuError{
+			reason: AidokuErrorKind::JsonParseError
+		});
+	}
+
+	let response = request.json().unwrap();
 	let page_number = response.as_object().unwrap().get("pages").as_int().unwrap();
 	Ok((1..page_number).map(|i| Page {
 		index: i as i32,
