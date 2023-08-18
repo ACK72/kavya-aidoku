@@ -103,7 +103,7 @@ fn get_manga_list(filters: Vec<Filter>, page: i32) -> Result<MangaPageResult> {
 		});
 	}
 
-	let has_more = result.len() == 40 && !query.is_empty();
+	let has_more = result.len() == 40 && query.is_empty();
 	Ok(MangaPageResult{
 		manga: result,
 		has_more: has_more
